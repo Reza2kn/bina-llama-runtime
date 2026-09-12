@@ -12,7 +12,7 @@ if os.name=='nt':
     os.environ['PATH']=str(sdk/'Bin')+os.pathsep+os.environ['PATH']
 else:
     run('sudo','apt-get','update')
-    run('sudo','apt-get','install','-y','libvulkan-dev','glslc','ninja-build')
+    run('sudo','apt-get','install','-y','libvulkan-dev','glslc','ninja-build','spirv-headers')
 run('git','clone','--depth','1','https://github.com/ggml-org/llama.cpp.git','upstream')
 os.chdir('upstream')
 run('git','fetch','--depth','1','origin','3057bb66c86c46d5781e50e85462a760ba7d1feb')
