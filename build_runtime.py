@@ -5,7 +5,7 @@ root=pathlib.Path.cwd()
 if os.name=='nt':
     version='1.4.357.0'
     installer=root/'vulkan.exe'
-    urllib.request.urlretrieve(f'https://sdk.lunarg.com/sdk/download/{version}/windows/vulkansdk-windows-X64-{version}.exe',installer)
+    run('curl.exe','--fail','--location','--retry','3','--output',str(installer),f'https://sdk.lunarg.com/sdk/download/{version}/windows/vulkansdk-windows-X64-{version}.exe')
     run(str(installer),'--accept-licenses','--default-answer','--confirm-command','install')
     sdk=pathlib.Path('C:/VulkanSDK')/version
     os.environ['VULKAN_SDK']=str(sdk)
@@ -28,5 +28,6 @@ for f in binpath.iterdir():
     if f.is_file(): shutil.copy2(f,package/f.name)
 shutil.copy2('upstream/LICENSE',package/'LLAMA-LICENSE')
 shutil.copy2('surya-wordlevel.patch',package)
+if os.name!='nt': os.environ['LD_LIBRARY_PATH']=str(package)
 for exe in ['llama-mtmd-cli','llama-server']:
     run(str(package/(exe+('.exe' if os.name=='nt' else ''))),'--version')
