@@ -1,0 +1,108 @@
+diff --git a/conversion/qwen.py b/conversion/qwen.py
+index c7e0809..002e48f 100644
+--- a/conversion/qwen.py
++++ b/conversion/qwen.py
+@@ -639,6 +639,33 @@ class _Qwen35MRopeMixin:
+ class Qwen3_5TextModel(_Qwen35MRopeMixin, _LinearAttentionVReorderBase):
+     model_arch = gguf.MODEL_ARCH.QWEN35
+ 
++    def set_vocab(self):
++        tokenizer_path = self.dir_model / "tokenizer.json"
++        data = json.loads(tokenizer_path.read_text())
++        if data["model"]["type"] != "WordLevel":
++            return super().set_vocab()
++        assert data["pre_tokenizer"] == {"type": "Split", "pattern": {"Regex": "."}, "behavior": "Isolated", "invert": False}
++        assert data["normalizer"] is None and data["decoder"]["type"] == "Fuse"
++        vocab = data["model"]["vocab"]
++        tokens = [""] * len(vocab)
++        types = [gguf.TokenType.NORMAL] * len(vocab)
++        for token, idx in vocab.items(): tokens[idx] = token
++        for added in data["added_tokens"]:
++            assert not added["lstrip"] and not added["rstrip"] and not added["single_word"]
++            types[added["id"]] = gguf.TokenType.CONTROL if added["special"] else gguf.TokenType.USER_DEFINED
++        types[vocab[data["model"]["unk_token"]]] = gguf.TokenType.UNKNOWN
++        self.gguf_writer.add_tokenizer_model("surya-wordlevel")
++        self.gguf_writer.add_tokenizer_pre("gpt-2")
++        self.gguf_writer.add_token_list(tokens)
++        self.gguf_writer.add_token_types(types)
++        self.gguf_writer.add_token_merges([])
++        self.gguf_writer.add_unk_token_id(vocab["<unk>"])
++        self.gguf_writer.add_eos_token_id(vocab["<|im_end|>"])
++        self.gguf_writer.add_add_bos_token(False)
++        self.gguf_writer.add_add_eos_token(False)
++        self.gguf_writer.add_chat_template((self.dir_model / "chat_template.jinja").read_text())
++
++
+ 
+ @ModelBase.register("Qwen3_5MoeForConditionalGeneration", "Qwen3_5MoeForCausalLM")
+ @ModelBase.example("Qwen/Qwen3.5-35B-A3B")
+diff --git a/src/llama-vocab.cpp b/src/llama-vocab.cpp
+index ee65faf..e6d1444 100644
+--- a/src/llama-vocab.cpp
++++ b/src/llama-vocab.cpp
+@@ -1721,6 +1721,22 @@ private:
+     const llama_vocab & vocab;
+ };
+ 
++// Surya OCR WordLevel + Split(Regex("."), Isolated), with Fuse decoding.
++struct llm_tokenizer_surya_session : llm_tokenizer_bpe_session {
++    llm_tokenizer_surya_session(const llama_vocab & v, const llm_tokenizer_bpe & t) : llm_tokenizer_bpe_session(v, t), vocab(v) {}
++    const llama_vocab & vocab;
++    void tokenize(const std::string & text, std::vector<llama_token> & output) override {
++        for (size_t pos = 0; pos < text.size();) {
++            size_t len = std::min((size_t)unicode_len_utf8(text[pos]), text.size() - pos);
++            // Dot does not match LF: consecutive unmatched LFs are one WordLevel segment.
++            if (text[pos] == '\n') { len = 1; while (pos + len < text.size() && text[pos + len] == '\n') ++len; }
++            auto token = vocab.text_to_token(text.substr(pos, len));
++            output.push_back(token == LLAMA_TOKEN_NULL ? vocab.token_unk() : token);
++            pos += len;
++        }
++    }
++};
++
+ struct llm_tokenizer_whitespace_session : llm_tokenizer_bpe_session {
+     llm_tokenizer_whitespace_session(const llama_vocab & vocab, const llm_tokenizer_bpe & tokenizer) : llm_tokenizer_bpe_session{vocab, tokenizer}, vocab{vocab} {}
+ 
+@@ -1984,20 +2000,20 @@ void llama_vocab::impl::load(llama_model_loader & ml, const LLM_KV & kv) {
+             special_mask_id = 103;
+ 
+             add_sep = true;
+-        } else if (tokenizer_model == "gpt2" || tokenizer_model == "hybriddna" || tokenizer_model == "whitespace") {
++        } else if (tokenizer_model == "surya-wordlevel" || tokenizer_model == "gpt2" || tokenizer_model == "hybriddna" || tokenizer_model == "whitespace") {
+             type = LLAMA_VOCAB_TYPE_BPE;
+ 
+             // read bpe merges and populate bpe ranks
+             const int merges_keyidx = gguf_find_key(ctx, kv(LLM_KV_TOKENIZER_MERGES).c_str());
+             // Kimi-K2 uses custom tokenization without traditional BPE merges
+-            const bool is_kimi_k2 = (tokenizer_pre == "kimi-k2");
++            const bool is_kimi_k2 = (tokenizer_pre == "kimi-k2" || tokenizer_model == "surya-wordlevel");
+ 
+             if (merges_keyidx == -1) {
+                 if (!is_kimi_k2) {
+                     throw std::runtime_error("cannot find tokenizer merges in model file\n");
+                 }
+                 // Kimi-K2 doesn't need merges, skip
+-                LLAMA_LOG_INFO("%s: Kimi-K2 tokenizer detected, skipping BPE merges\n", __func__);
++                LLAMA_LOG_INFO("%s: Non-BPE tokenizer detected, skipping BPE merges\n", __func__);
+             } else {
+                 if (gguf_get_kv_type(ctx, merges_keyidx) != GGUF_TYPE_ARRAY ||
+                     gguf_get_arr_type(ctx, merges_keyidx) != GGUF_TYPE_STRING) {
+@@ -3459,7 +3475,9 @@ std::vector<llama_token> llama_vocab::impl::tokenize(
+                 const llm_tokenizer_bpe * tok_bpe = static_cast<const llm_tokenizer_bpe *>(tokenizer.get());
+ 
+                 std::unique_ptr<llm_tokenizer_bpe_session> session;
+-                if (vocab.get_tokenizer_model() == "hybriddna") {
++                if (vocab.get_tokenizer_model() == "surya-wordlevel") {
++                    session = std::make_unique<llm_tokenizer_surya_session>(vocab, *tok_bpe);
++                } else if (vocab.get_tokenizer_model() == "hybriddna") {
+                     session = std::make_unique<llm_tokenizer_hybriddna_session>(vocab, *tok_bpe);
+                 } else if (vocab.get_tokenizer_model() == "whitespace") {
+                     session = std::make_unique<llm_tokenizer_whitespace_session>(vocab, *tok_bpe);
+@@ -3657,6 +3675,7 @@ int32_t llama_vocab::impl::token_to_piece(llama_token token, char * buf, int32_t
+                     return _try_copy(token_text.data(), token_text.size());
+                 }
+                 if (attr & LLAMA_TOKEN_ATTR_NORMAL) {
++                    if (tokenizer_model == "surya-wordlevel") return _try_copy(token_text.data(), token_text.size());
+                     if (escape_whitespaces) {
+                         // SPM-style BPE: tokens contain ▁ for spaces
+                         std::string result = token_text;

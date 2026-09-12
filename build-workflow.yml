@@ -1,0 +1,50 @@
+name: Patched Bina runtime
+on: [push, workflow_dispatch]
+permissions:
+  contents: read
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-22.04, windows-2022]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Fetch pinned upstream and apply patch
+        shell: bash
+        run: |
+          git clone https://github.com/ggml-org/llama.cpp.git upstream
+          cd upstream
+          git checkout 3057bb66c86c46d5781e50e85462a760ba7d1feb
+          git apply ../surya-wordlevel.patch
+      - name: Linux dependencies
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libvulkan-dev glslc ninja-build
+      - name: Windows Vulkan SDK
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $version = '1.4.357.0'
+          curl.exe -L --fail -o "$env:RUNNER_TEMP/vulkan.exe" "https://sdk.lunarg.com/sdk/download/$version/windows/vulkansdk-windows-X64-$version.exe"
+          Start-Process -Wait "$env:RUNNER_TEMP/vulkan.exe" -ArgumentList '--accept-licenses --default-answer --confirm-command install'
+          "VULKAN_SDK=C:\VulkanSDK\$version" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "C:\VulkanSDK\$version\Bin" | Out-File -FilePath $env:GITHUB_PATH -Append
+      - name: Build
+        shell: bash
+        run: |
+          cmake -S upstream -B build -DCMAKE_BUILD_TYPE=Release -DGGML_NATIVE=OFF -DGGML_VULKAN=ON -DGGML_CUDA=OFF -DLLAMA_CURL=OFF -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_BORINGSSL=OFF
+          cmake --build build --config Release -j 4 --target llama-mtmd-cli llama-server
+      - name: Smoke test and package
+        shell: bash
+        run: |
+          mkdir -p package
+          if [ -d build/bin/Release ]; then cp build/bin/Release/* package/; else cp -L build/bin/* package/; fi
+          cp upstream/LICENSE package/LLAMA-LICENSE
+          cp surya-wordlevel.patch package/
+          package/llama-mtmd-cli --version
+          package/llama-server --version
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bina-runtime-${{ runner.os }}-x64-vulkan
+          path: package/
